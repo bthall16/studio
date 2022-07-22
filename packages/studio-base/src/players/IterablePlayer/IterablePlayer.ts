@@ -138,7 +138,6 @@ export class IterablePlayer implements Player {
   private _receivedBytes: number = 0;
   private _hasError = false;
   private _lastRangeMillis?: number;
-  private _closed: boolean = false;
   private _lastMessage?: MessageEvent<unknown>;
   private _publishedTopics = new Map<string, Set<string>>();
   private _seekTarget?: Time;
@@ -892,7 +891,6 @@ export class IterablePlayer implements Player {
 
   private async _stateClose() {
     this._isPlaying = false;
-    this._closed = true;
     this._metricsCollector.close();
     await this._bufferedSource.stopProducer();
     await this._playbackIterator?.return?.();
