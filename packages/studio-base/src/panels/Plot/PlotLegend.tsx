@@ -121,14 +121,12 @@ const useStyles = makeStyles((theme: Theme) => ({
     backgroundColor: "transparent !important",
     padding: "4px !important",
   },
-  footer: ({ legendDisplay }: StyleProps) => ({
+  footer: ({ showPlotValuesInLegend = false }: StyleProps) => ({
     padding: theme.spacing(0.5),
-    gridColumn: "span 4",
-    ...(legendDisplay !== "floating" && {
-      position: "sticky",
-      right: 0,
-      left: 0,
-    }),
+    gridColumn: showPlotValuesInLegend ? "span 4" : "span 3",
+    position: "sticky",
+    right: 0,
+    left: 0,
   }),
   floatingWrapper: {
     overflow: "hidden",
