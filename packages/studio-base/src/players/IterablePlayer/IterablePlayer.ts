@@ -49,7 +49,7 @@ const DEFAULT_CACHE_SIZE_BYTES = 1.0e9;
 
 // Amount to wait until panels have had the chance to subscribe to topics before
 // we start playback
-const SEEK_START_DELAY_MS = 100;
+const START_DELAY_MS = 100;
 
 // Messages are laid out in blocks with a fixed number of milliseconds.
 const MIN_MEM_CACHE_BLOCK_SIZE_NS = 0.1e9;
@@ -83,7 +83,6 @@ type IterablePlayerOptions = {
 type IterablePlayerState =
   | "preinit"
   | "initialize"
-  | "start-delay"
   | "start-play"
   | "idle"
   | "seek-backfill"
@@ -342,9 +341,6 @@ export class IterablePlayer implements Player {
           case "initialize":
             await this._stateInitialize();
             break;
-          case "start-delay":
-            await this._stateStartDelay();
-            break;
           case "start-play":
             await this._stateStartPlay();
             break;
@@ -442,20 +438,13 @@ export class IterablePlayer implements Player {
       this._setError(`Error initializing: ${error.message}`, error);
     }
     await this._emitState();
+
     if (!this._hasError) {
-      this._setState("start-delay");
+      // Wait a bit until panels have had the chance to subscribe to topics before we start
+      // playback.
+      await delay(START_DELAY_MS);
+      this._setState("start-play");
     }
-  }
-
-  // Wait a bit until panels have had the chance to subscribe to topics before we start
-  // playback.
-  private async _stateStartDelay() {
-    await new Promise((resolve) => setTimeout(resolve, SEEK_START_DELAY_MS));
-    if (this._closed || this._nextState) {
-      return;
-    }
-
-    this._setState("start-play");
   }
 
   private async _stateResetPlaybackIterator() {
