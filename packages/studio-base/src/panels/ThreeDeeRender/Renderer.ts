@@ -313,6 +313,8 @@ export class Renderer extends EventEmitter<RendererEvents> {
     this.orthographicCamera = new THREE.OrthographicCamera();
     this.controls = new OrbitControls(this.perspectiveCamera, this.canvas);
     this.controls.screenSpacePanning = false; // only allow panning in the XY plane
+    this.controls.mouseButtons.LEFT = THREE.MOUSE.PAN;
+    this.controls.mouseButtons.RIGHT = THREE.MOUSE.ROTATE;
     this.controls.addEventListener("change", () => {
       if (!this._isUpdatingCameraState) {
         this.emit("cameraMove", this);
