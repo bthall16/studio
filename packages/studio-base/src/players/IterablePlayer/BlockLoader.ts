@@ -5,6 +5,7 @@
 import { simplify } from "intervals-fn";
 import { isEqual } from "lodash";
 
+import { Condvar } from "@foxglove/den/async";
 import { filterMap } from "@foxglove/den/collection";
 import Log from "@foxglove/log";
 import { Time, subtract as subtractTimes, toNanoSec, add, fromNanoSec } from "@foxglove/rostime";
@@ -36,9 +37,7 @@ type BlockSpan = {
 type Blocks = (MessageBlock | undefined)[];
 
 type LoadArgs = {
-  abortSignal: AbortSignal;
-  startTime: Time;
-  progress: (progress: Progress) => Promise<void>;
+  progress: (progress: Progress) => void;
 };
 
 /**
@@ -52,7 +51,10 @@ export class BlockLoader {
   private blockDurationNanos: number;
   private topics: Set<string> = new Set();
   private maxCacheSize: number = 0;
+  private activeBlockId: number = 0;
   private problemManager: PlayerProblemManager;
+  private stopped: boolean = false;
+  private activeChangeCondvar: Condvar = new Condvar();
 
   constructor(args: BlockLoaderArgs) {
     this.source = args.source;
@@ -76,17 +78,105 @@ export class BlockLoader {
     this.blocks = Array.from({ length: blockCount });
   }
 
-  setTopics(topics: Set<string>): void {
-    log.debug("setTopics", topics);
-    this.topics = topics;
+  setActiveTime(time: Time): void {
+    const startTime = subtractTimes(subtractTimes(time, this.start), { sec: 1, nsec: 0 });
+    const startNs = Math.max(0, Number(toNanoSec(startTime)));
+    const beginBlockId = Math.floor(startNs / this.blockDurationNanos);
+
+    if (beginBlockId === this.activeBlockId) {
+      return;
+    }
+
+    console.log("blockid chagnged", beginBlockId);
+    this.activeBlockId = beginBlockId;
+    this.activeChangeCondvar.notifyAll();
   }
 
-  async load(args: LoadArgs): Promise<void> {
-    log.info("Start block load", args.startTime);
+  setTopics(topics: Set<string>): void {
+    if (isEqual(topics, this.topics)) {
+      return;
+    }
 
+    this.topics = topics;
+    this.activeChangeCondvar.notifyAll();
+  }
+
+  async stopLoading(): Promise<void> {
+    this.stopped = true;
+    this.activeChangeCondvar.notifyAll();
+  }
+
+  async startLoading(args: LoadArgs): Promise<void> {
+    log.debug("Start loading process");
+    this.stopped = false;
+
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    while (!this.stopped) {
+      const activeBlockId = this.activeBlockId;
+      const topics = this.topics;
+
+      // fimxe
+      // topics have changed, loading will bail
+      // now we see that our active block id hs the topic we want
+      // because make it was from a prior load
+      // but the blocks after active don't have that topic
+      // so if we bail because active has it ... we won't fetch those blocks
+      //
+      const cachedBlock = this.blocks[activeBlockId];
+      if (cachedBlock) {
+        // if has all topics
+        // then we wait
+
+        const blockTopics = Object.keys(cachedBlock.messagesByTopic);
+
+        const topicsToFetch = new Set(topics);
+        for (const topic of blockTopics) {
+          topicsToFetch.delete(topic);
+        }
+        if (topicsToFetch.size === 0) {
+          await this.activeChangeCondvar.wait();
+
+          continue;
+        }
+      }
+
+      // fixme - we are constantly recomputing spans because the blocks are small
+      // and we are playing data
+      // but when we are playing, we don't actually need to re-compute the spans because
+      // they haven't changed
+      // all that changes are the blocks we need to load vs evict
+
+      // Load around the active block id, if the active block id changes then bail
+      await this.load({ progress: args.progress });
+
+      // fixme
+      // when load has finished, we still get notified even tho there's nothing to do!!
+      // when the block we seek to is < existing, then we might need to load again
+      // actually - as we move forward, we might need to load because we can evict another block
+      // this is actually a disaster scenario? we are going to _fetch_ a tiny request worth of data
+      // because we will only be able to purge a tiny amount
+      // starting at the activeBlockId, and going until when?
+      // we don't actually know if we can hold more - all we know is we need to fetch the active block id
+      // if the active block id is present, then there's nothing else to do?
+      // when topics change we bail
+
+      // The active block id is the same as when we started.
+      // Wait for it to possibly change.
+      if (this.activeBlockId === activeBlockId && this.topics === topics) {
+        await this.activeChangeCondvar.wait();
+      }
+    }
+  }
+
+  private async load(args: { progress: LoadArgs["progress"] }): Promise<void> {
     const topics = this.topics;
 
     let progress = this.calculateProgress(topics);
+
+    // Ignore changing the blocks if the topic list is empty
+    if (topics.size === 0) {
+      return;
+    }
 
     // Block caching works on the assumption that when seeking, the user wants to look at some
     // data before and after the current time.
@@ -102,11 +192,7 @@ export class BlockLoader {
     //
     // When we need to evict, we evict backwards from the load blocks, so we evict: 3, 2, 1, 9, etc
 
-    // turn startTime into a block ID with a min block id of 0
-    const startTime = subtractTimes(subtractTimes(args.startTime, this.start), { sec: 1, nsec: 0 });
-    const startNs = Math.max(0, Number(toNanoSec(startTime)));
-    const beginBlockId = Math.floor(startNs / this.blockDurationNanos);
-
+    const beginBlockId = this.activeBlockId;
     const startBlockId = 0;
     const endBlockId = this.blocks.length - 1;
 
@@ -152,6 +238,20 @@ export class BlockLoader {
 
       return spans;
     };
+
+    // fixme
+    // we have a bunch of block
+    // [0, 1, 2, 3, 4]
+    // At any time, we have a activeBlockId which is the block we are "viewing"
+    //
+    // [0, 1, 2, 3, 4]
+    //        ^
+    // we evict by going backwards from begin block (wrap around until back to begin block)
+    //
+    // when the begin block changes...
+    // we scan from begin block forwards - till when? till currentBlockId
+    // cause thats when we've filled until
+    // if there are any gaps, then we need to bail cause we will need to backfill
 
     // When the list of topics changes, we want to avoid loading topics if the block already has the
     // topic. Create spans of blocks based on which topics are needed. This allows us reduce
@@ -202,10 +302,6 @@ export class BlockLoader {
 
       let sizeInBytes = 0;
       for await (const iterResult of iterator) {
-        if (args.abortSignal.aborted) {
-          return;
-        }
-
         if (iterResult.problem) {
           this.problemManager.addProblem(`connid-${iterResult.connectionId}`, iterResult.problem);
           continue;
@@ -243,6 +339,46 @@ export class BlockLoader {
 
           // Set the new block to the id of our latest message
           currentBlockId = messageBlockId;
+
+          // fixme - we don't necesarily need to bail here
+          // we only need to do what?
+          // re-order the list of what we should be fetching
+          // make sure all the blocks after our desired block are present
+          // if they are, then we can continue doing what we were
+          // if topics changes?
+
+          // If the topics have changed we have to re-compute the spans, so we
+          // bail this loading instance.
+          if (topics !== this.topics) {
+            log.debug("topics changed, aborting load instance");
+            return;
+          }
+
+          // When the active block id changes, we need to check whether the active block
+          // is loaded through where we are loading (or the end if active block is after currentBlockId)
+
+          if (beginBlockId !== this.activeBlockId) {
+            const endId =
+              this.activeBlockId <= currentBlockId ? currentBlockId : this.blocks.length - 1;
+
+            // The active block is the one we are loading, so we keep going
+            if (this.activeBlockId !== currentBlockId) {
+              for (let idx = this.activeBlockId; idx < endId; ++idx) {
+                const checkBlock = this.blocks[idx];
+
+                const blockTopics = checkBlock ? Object.keys(checkBlock.messagesByTopic) : [];
+
+                const topicsToFetch = new Set(topics);
+                for (const topic of blockTopics) {
+                  topicsToFetch.delete(topic);
+                }
+                if (topicsToFetch.size > 0) {
+                  log.debug("active block changed, aborting load instance");
+                  return;
+                }
+              }
+            }
+          }
         }
 
         const msgTopic = iterResult.msgEvent.topic;
@@ -282,7 +418,7 @@ export class BlockLoader {
         totalBlockSizeBytes += messageSizeInBytes;
         events.push(iterResult.msgEvent);
 
-        await args.progress(progress);
+        args.progress(progress);
       }
 
       // Close out the current block with the aggregated messages. Fill any blocks between
@@ -309,7 +445,7 @@ export class BlockLoader {
       progress = this.calculateProgress(topics);
     }
 
-    await args.progress(progress);
+    args.progress(progress);
   }
 
   /// ---- private

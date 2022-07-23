@@ -159,6 +159,8 @@ export class IterablePlayer implements Player {
   private _playbackIterator?: AsyncIterator<Readonly<IteratorResult>>;
 
   private _blockLoader?: BlockLoader;
+  private _blockLoadingProcess?: Promise<void>;
+  private _emitting: boolean = false;
 
   private readonly _sourceId: string;
 
@@ -231,6 +233,8 @@ export class IterablePlayer implements Player {
 
     this._metricsCollector.seek(targetTime);
     this._seekTarget = targetTime;
+
+    this._blockLoader?.setActiveTime(targetTime);
     this._setState("seek-backfill");
   }
 
@@ -307,7 +311,9 @@ export class IterablePlayer implements Player {
     // Support moving between idle (pause) and play and preserving the playback iterator
     if (newState !== "idle" && newState !== "play" && this._playbackIterator) {
       log.info("Ending playback iterator because next state is not IDLE or PLAY");
-      void this._playbackIterator.return?.().catch((err) => {
+      const oldIterator = this._playbackIterator;
+      this._playbackIterator = undefined;
+      void oldIterator.return?.().catch((err) => {
         log.error(err);
       });
     }
@@ -421,16 +427,18 @@ export class IterablePlayer implements Player {
         idx += 1;
       }
 
-      // --- setup blocks
-      this._blockLoader = new BlockLoader({
-        cacheSizeBytes: DEFAULT_CACHE_SIZE_BYTES,
-        source: this._iterableSource,
-        start: this._start,
-        end: this._end,
-        maxBlocks: MAX_BLOCKS,
-        minBlockDurationNs: MIN_MEM_CACHE_BLOCK_SIZE_NS,
-        problemManager: this._problemManager,
-      });
+      if (this._enablePreload) {
+        // --- setup blocks
+        this._blockLoader = new BlockLoader({
+          cacheSizeBytes: DEFAULT_CACHE_SIZE_BYTES,
+          source: this._iterableSource,
+          start: this._start,
+          end: this._end,
+          maxBlocks: MAX_BLOCKS,
+          minBlockDurationNs: MIN_MEM_CACHE_BLOCK_SIZE_NS,
+          problemManager: this._problemManager,
+        });
+      }
 
       // set the initial topics for the loader
     } catch (error) {
@@ -442,11 +450,18 @@ export class IterablePlayer implements Player {
       // Wait a bit until panels have had the chance to subscribe to topics before we start
       // playback.
       await delay(START_DELAY_MS);
+
+      this._blockLoader?.setActiveTime(this._start);
+      this._blockLoader?.setTopics(this._partialTopics);
+
+      // Block loadings is constantly running and tries to keep the preloaded messages in memory
+      this._blockLoadingProcess = this.startBlockLoading();
+
       this._setState("start-play");
     }
   }
 
-  private async _stateResetPlaybackIterator() {
+  private async resetPlaybackIterator() {
     if (!this._currentTime) {
       throw new Error("Invariant: Tried to reset playback iterator with no current time.");
     }
@@ -462,7 +477,14 @@ export class IterablePlayer implements Player {
       topics: Array.from(this._allTopics),
       start: next,
     });
+  }
 
+  private async _stateResetPlaybackIterator() {
+    if (!this._currentTime) {
+      throw new Error("Invariant: Tried to reset playback iterator with no current time.");
+    }
+
+    await this.resetPlaybackIterator();
     this._setState(this._isPlaying ? "play" : "idle");
   }
 
@@ -603,18 +625,27 @@ export class IterablePlayer implements Player {
     this._currentTime = targetTime;
     this._lastSeekEmitTime = Date.now();
     this._presence = PlayerPresence.PRESENT;
+    console.log("emit");
     await this._emitState();
     // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition, @typescript-eslint/strict-boolean-expressions
     if (this._nextState) {
       return;
     }
 
-    this._setState("reset-playback-iterator");
+    await this.resetPlaybackIterator();
+    this._setState(this._isPlaying ? "play" : "idle");
   }
 
   /** Emit the player state to the registered listener */
   private async _emitState() {
     if (!this._listener) {
+      return;
+    }
+
+    if (this._emitting) {
+      // fixme - the blocks backfill update means we are already emitting
+      // need debouncePromise :'(
+      console.log("already emitting");
       return;
     }
 
@@ -640,6 +671,9 @@ export class IterablePlayer implements Player {
     this._messages = [];
 
     const currentTime = this._currentTime ?? this._start;
+
+    // Notify the block loader about the current time so it tries to keep current time loaded
+    this._blockLoader?.setActiveTime(currentTime);
 
     const data: PlayerState = {
       name: this._name,
@@ -670,7 +704,12 @@ export class IterablePlayer implements Player {
       },
     };
 
-    return await this._listener(data);
+    try {
+      this._emitting = true;
+      return await this._listener(data);
+    } finally {
+      this._emitting = false;
+    }
   }
 
   /**
@@ -789,12 +828,6 @@ export class IterablePlayer implements Player {
       return;
     }
 
-    if (this._currentTime) {
-      const start = performance.now();
-      await this.loadBlocks(this._currentTime);
-      log.info(`Block load took: ${performance.now() - start} ms`);
-    }
-
     // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition, @typescript-eslint/strict-boolean-expressions
     if (this._nextState) {
       return;
@@ -841,7 +874,6 @@ export class IterablePlayer implements Player {
     // get new messages for new topics
     const allTopics = this._allTopics;
 
-    const blockLoading = this.loadBlocks(this._currentTime, { emit: false });
     try {
       while (this._isPlaying && !this._hasError && !this._nextState) {
         const start = Date.now();
@@ -884,61 +916,37 @@ export class IterablePlayer implements Player {
     } catch (err) {
       this._setError((err as Error).message, err);
       await this._emitState();
-    } finally {
-      await blockLoading;
     }
   }
 
   private async _stateClose() {
     this._isPlaying = false;
     this._metricsCollector.close();
+    await this._blockLoader?.stopLoading();
+    await this._blockLoadingProcess;
     await this._bufferedSource.stopProducer();
     await this._playbackIterator?.return?.();
     this._playbackIterator = undefined;
   }
 
-  private async loadBlocks(time: Time, opt?: { emit: boolean }) {
-    if (!this._enablePreload) {
-      return;
-    }
+  private async startBlockLoading() {
+    let nextEmit = 0;
 
-    this._blockLoader?.setTopics(this._partialTopics);
+    await this._blockLoader?.startLoading({
+      progress: async (progress) => {
+        this._progress = {
+          fullyLoadedFractionRanges: this._progress.fullyLoadedFractionRanges,
+          messageCache: progress.messageCache,
+        };
 
-    if (this._abort) {
-      throw new Error("Invariant. Abort controller already defined");
-    }
-    this._abort = new AbortController();
-
-    try {
-      // During playback, we let the statePlay method emit state
-      // When idle, we can emit state
-      const shouldEmit = opt?.emit ?? true;
-
-      let nextEmit = 0;
-      await this._blockLoader?.load({
-        abortSignal: this._abort.signal,
-        startTime: time,
-        progress: async (progress) => {
-          this._progress = {
-            fullyLoadedFractionRanges: this._bufferedSource.loadedRanges(),
-            messageCache: progress.messageCache,
-          };
-
-          // We throttle emitting the state since we could be loading blocks faster than 60fps and it
-          // is actually slower to try rendering with each new block compared to spacing out the
-          // rendering.
-          if (shouldEmit && Date.now() >= nextEmit) {
-            await this._emitState();
-            nextEmit = Date.now() + 100;
-          }
-        },
-      });
-
-      if (shouldEmit) {
-        await this._emitState();
-      }
-    } finally {
-      this._abort = undefined;
-    }
+        // We throttle emitting the state since we could be loading blocks faster than 60fps and it
+        // is actually slower to try rendering with each new block compared to spacing out the
+        // rendering.
+        if (Date.now() >= nextEmit) {
+          await this._emitState();
+          nextEmit = Date.now() + 100;
+        }
+      },
+    });
   }
 }

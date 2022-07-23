@@ -1,4 +1,3 @@
-/** @jest-environment jsdom */
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/
@@ -50,10 +49,7 @@ describe("BlockLoader", () => {
       problemManager: new PlayerProblemManager(),
     });
 
-    const abort = new AbortController();
-    await loader.load({
-      abortSignal: abort.signal,
-      startTime: { sec: 0, nsec: 0 },
+    await loader.startLoading({
       progress: async (progress) => {
         expect(progress).toEqual({
           fullyLoadedFractionRanges: [],
@@ -79,10 +75,7 @@ describe("BlockLoader", () => {
       problemManager: new PlayerProblemManager(),
     });
 
-    const abort = new AbortController();
-    await loader.load({
-      abortSignal: abort.signal,
-      startTime: { sec: 0, nsec: 0 },
+    await loader.startLoading({
       progress: async (progress) => {
         expect(progress).toEqual({
           fullyLoadedFractionRanges: [],
@@ -110,10 +103,7 @@ describe("BlockLoader", () => {
 
     loader.setTopics(new Set(["foo"]));
 
-    const abort = new AbortController();
-    await loader.load({
-      abortSignal: abort.signal,
-      startTime: { sec: 0, nsec: 0 },
+    await loader.startLoading({
       progress: async (progress) => {
         expect(progress).toEqual({
           fullyLoadedFractionRanges: [
