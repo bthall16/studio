@@ -514,8 +514,12 @@ describe("BlockLoader", () => {
     expect.assertions(6);
   });
 
+  // fixme - jumping forward in time while loading doesn't work
+
   // fixme
   // when changing the active time and all blocks are loaded, we still emit progress several times?
   // strange because we didn't actually change anything...
   // as active time continues to change we continue to emit progress - again nothing changed...
+
+  // fixme - sometimes it looks like blocks are evicted even tho we don't need to evict?
 });
