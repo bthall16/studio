@@ -8,7 +8,14 @@ import { isEqual } from "lodash";
 import { Condvar } from "@foxglove/den/async";
 import { filterMap } from "@foxglove/den/collection";
 import Log from "@foxglove/log";
-import { Time, subtract as subtractTimes, toNanoSec, add, fromNanoSec } from "@foxglove/rostime";
+import {
+  Time,
+  subtract as subtractTimes,
+  toNanoSec,
+  add,
+  fromNanoSec,
+  clampTime,
+} from "@foxglove/rostime";
 import { MessageEvent } from "@foxglove/studio";
 import PlayerProblemManager from "@foxglove/studio-base/players/PlayerProblemManager";
 import { MessageBlock, Progress } from "@foxglove/studio-base/players/types";
@@ -87,7 +94,6 @@ export class BlockLoader {
       return;
     }
 
-    console.log("blockid chagnged", beginBlockId);
     this.activeBlockId = beginBlockId;
     this.activeChangeCondvar.notifyAll();
   }
@@ -102,8 +108,11 @@ export class BlockLoader {
   }
 
   async stopLoading(): Promise<void> {
+    log.debug("Stop loading blocks");
     this.stopped = true;
     this.activeChangeCondvar.notifyAll();
+
+    // fixme - should this be async and wait on loading to actually stop?
   }
 
   async startLoading(args: LoadArgs): Promise<void> {
@@ -115,50 +124,13 @@ export class BlockLoader {
       const activeBlockId = this.activeBlockId;
       const topics = this.topics;
 
-      // fimxe
-      // topics have changed, loading will bail
-      // now we see that our active block id hs the topic we want
-      // because make it was from a prior load
-      // but the blocks after active don't have that topic
-      // so if we bail because active has it ... we won't fetch those blocks
-      //
-      const cachedBlock = this.blocks[activeBlockId];
-      if (cachedBlock) {
-        // if has all topics
-        // then we wait
-
-        const blockTopics = Object.keys(cachedBlock.messagesByTopic);
-
-        const topicsToFetch = new Set(topics);
-        for (const topic of blockTopics) {
-          topicsToFetch.delete(topic);
-        }
-        if (topicsToFetch.size === 0) {
-          await this.activeChangeCondvar.wait();
-
-          continue;
-        }
-      }
-
-      // fixme - we are constantly recomputing spans because the blocks are small
-      // and we are playing data
-      // but when we are playing, we don't actually need to re-compute the spans because
-      // they haven't changed
-      // all that changes are the blocks we need to load vs evict
-
       // Load around the active block id, if the active block id changes then bail
       await this.load({ progress: args.progress });
 
-      // fixme
-      // when load has finished, we still get notified even tho there's nothing to do!!
-      // when the block we seek to is < existing, then we might need to load again
-      // actually - as we move forward, we might need to load because we can evict another block
-      // this is actually a disaster scenario? we are going to _fetch_ a tiny request worth of data
-      // because we will only be able to purge a tiny amount
-      // starting at the activeBlockId, and going until when?
-      // we don't actually know if we can hold more - all we know is we need to fetch the active block id
-      // if the active block id is present, then there's nothing else to do?
-      // when topics change we bail
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+      if (this.stopped) {
+        break;
+      }
 
       // The active block id is the same as when we started.
       // Wait for it to possibly change.
@@ -175,280 +147,281 @@ export class BlockLoader {
 
     // Ignore changing the blocks if the topic list is empty
     if (topics.size === 0) {
+      args.progress(progress);
       return;
     }
 
-    // Block caching works on the assumption that when seeking, the user wants to look at some
-    // data before and after the current time.
-    //
-    // When we start to load blocks, we start at 1 second before _time_ and load to the end.
-    // Then we load from the start to 1 second before.
-    //
-    // Given the following blocks and a load start time within block "5":
-    // [1, 2, 3, 4, 5, 6, 7, 8, 9]
-    //
-    // The block load order is:
-    // 4, 5, 6, 7, 8, 9, 1, 2, 3
-    //
-    // When we need to evict, we evict backwards from the load blocks, so we evict: 3, 2, 1, 9, etc
-
-    const beginBlockId = this.activeBlockId;
-    const startBlockId = 0;
-    const endBlockId = this.blocks.length - 1;
-
-    const computeSpans = (startIdx: number, endIdx: number) => {
-      const spans: BlockSpan[] = [];
-
-      let activeSpan: BlockSpan | undefined;
-      for (let i = startIdx; i < endIdx; ++i) {
-        // compute the topics this block needs
-        const existingBlock = this.blocks[i];
-        const blockTopics = existingBlock ? Object.keys(existingBlock.messagesByTopic) : [];
-
-        const topicsToFetch = new Set(topics);
-        for (const topic of blockTopics) {
-          topicsToFetch.delete(topic);
-        }
-
-        if (!activeSpan) {
-          activeSpan = {
-            beginId: i,
-            endId: i,
-            topics: topicsToFetch,
-          };
-          continue;
-        }
-
-        // If the topics of the active span equal the topics to fetch, grow the span
-        if (isEqual(activeSpan.topics, topicsToFetch)) {
-          activeSpan.endId = i;
-          continue;
-        }
-
-        spans.push(activeSpan);
-        activeSpan = {
-          beginId: i,
-          endId: i,
-          topics: topicsToFetch,
-        };
-      }
-      if (activeSpan) {
-        spans.push(activeSpan);
-      }
-
-      return spans;
-    };
-
-    // fixme
-    // we have a bunch of block
-    // [0, 1, 2, 3, 4]
-    // At any time, we have a activeBlockId which is the block we are "viewing"
-    //
-    // [0, 1, 2, 3, 4]
-    //        ^
-    // we evict by going backwards from begin block (wrap around until back to begin block)
-    //
-    // when the begin block changes...
-    // we scan from begin block forwards - till when? till currentBlockId
-    // cause thats when we've filled until
-    // if there are any gaps, then we need to bail cause we will need to backfill
-
-    // When the list of topics changes, we want to avoid loading topics if the block already has the
-    // topic. Create spans of blocks based on which topics are needed. This allows us reduce
-    // overhead by making longer more continuous requests.
-    const blockSpans: BlockSpan[] = [];
-
-    // The load order is from [beginBlock to endBlock], then [startBlock, beginBlock)
-    blockSpans.push(...computeSpans(beginBlockId, endBlockId + 1));
-    blockSpans.push(...computeSpans(startBlockId, beginBlockId));
-
-    log.debug("spans", blockSpans);
-
-    // The evict queue has the block ids that we can evict once we've reached our memory bounds.
-    const evictQueue: number[] = [];
-    for (let i = beginBlockId; i <= endBlockId; ++i) {
-      evictQueue.push(i);
-    }
-    for (let i = startBlockId; i < beginBlockId; ++i) {
-      evictQueue.push(i);
-    }
-    evictQueue.reverse();
-
     let totalBlockSizeBytes = this.cacheSize();
 
-    // Load all the spans, each span is a separate iterator because it requires different topics
-    for (const span of blockSpans) {
-      // No need to load spans with no topics
-      if (span.topics.size === 0) {
-        continue;
-      }
+    // We prioritize loading from the active block id to the end, then we load from the start to active block id
+    const segments: [number, number][] = [
+      [this.activeBlockId, this.blocks.length],
+      [0, this.activeBlockId],
+    ];
 
-      const iteratorStartTime = this.blockIdToStartTime(span.beginId);
-      const iteratorEndTime = this.blockIdToEndTime(span.endId);
+    for (const segment of segments) {
+      const [beginBlockId, lastBlockId] = segment;
 
-      const iterator = this.source.messageIterator({
-        topics: Array.from(span.topics),
-        start: iteratorStartTime,
-        end: iteratorEndTime,
-      });
+      // starting at beginBlockId, identify the first block we need to load
+      // this is our start block, from the start block identify to _load to_ block
+      // this is our end block
+      // load from start block up to end block
+      // if end block is at end, go back to 0 and keep going until we reach beginBlockId
+      for (let i = beginBlockId; i < lastBlockId; ++i) {
+        const fetchBlockId = i;
 
-      let messagesByTopic: Record<string, MessageEvent<unknown>[]> = {};
-      // Set all topic arrays to empty to indicate we've read this topic
-      for (const topic of span.topics) {
-        messagesByTopic[topic] = [];
-      }
+        // Topics we will fetch for this range
+        const topicsToFetch = new Set(topics);
 
-      let currentBlockId = span.beginId;
+        // fixme - track the needed topics for a block to avoid re-computing
+        {
+          const existingBlock = this.blocks[fetchBlockId];
+          const blockTopics = existingBlock ? Object.keys(existingBlock.messagesByTopic) : [];
 
-      let sizeInBytes = 0;
-      for await (const iterResult of iterator) {
-        if (iterResult.problem) {
-          this.problemManager.addProblem(`connid-${iterResult.connectionId}`, iterResult.problem);
-          continue;
-        }
-
-        const messageBlockId = this.timeToBlockId(iterResult.msgEvent.receiveTime);
-
-        // Message is for a different block.
-        // 1. Close out the current block.
-        // 2. Fill in any block gaps.
-        // 3. start a new block.
-        if (messageBlockId !== currentBlockId) {
-          // Close out the current block with the aggregated messages. Fill any blocks between
-          // current and the new block with empty topic arrays. We can use empty arrays because we
-          // know these blocks have no messages since messages arrive in time order.
-          for (let i = currentBlockId; i < messageBlockId; ++i) {
-            const existingBlock = this.blocks[i];
-
-            this.blocks[i] = {
-              messagesByTopic: {
-                ...existingBlock?.messagesByTopic,
-                ...messagesByTopic,
-              },
-              sizeInBytes: sizeInBytes + (existingBlock?.sizeInBytes ?? 0),
-            };
-
-            messagesByTopic = {};
-            // Set all topic arrays to empty to indicate we've read this topic
-            for (const topic of span.topics) {
-              messagesByTopic[topic] = [];
-            }
+          for (const topic of blockTopics) {
+            topicsToFetch.delete(topic);
           }
 
-          progress = this.calculateProgress(topics);
+          // This block is fully fetched, move on
+          if (topicsToFetch.size === 0) {
+            continue;
+          }
+        }
 
-          // Set the new block to the id of our latest message
-          currentBlockId = messageBlockId;
+        let endBlockId = fetchBlockId;
 
-          // fixme - we don't necesarily need to bail here
-          // we only need to do what?
-          // re-order the list of what we should be fetching
-          // make sure all the blocks after our desired block are present
-          // if they are, then we can continue doing what we were
-          // if topics changes?
+        // we've found a block that needs fetching
+        // now build a continuous span of the next blocks
+        for (let endIdx = fetchBlockId + 1; endIdx < this.blocks.length; ++endIdx) {
+          const nextBlock = this.blocks[endIdx];
+          const nextBlockTopics = nextBlock ? Object.keys(nextBlock.messagesByTopic) : [];
 
-          // If the topics have changed we have to re-compute the spans, so we
-          // bail this loading instance.
+          const nextTopicsToFetch = new Set(topics);
+          for (const topic of nextBlockTopics) {
+            nextTopicsToFetch.delete(topic);
+          }
+
+          // Our topics are equal to the next block, we can load them as one long range
+          if (isEqual(topicsToFetch, nextTopicsToFetch)) {
+            endBlockId = endIdx;
+          }
+        }
+
+        // we have a fetchBlockId which is the first block to fetch
+        // and we have an endBlockId which is the last block to fetch
+        // make a request to the source
+
+        const iteratorStartTime = this.blockIdToStartTime(fetchBlockId);
+        const iteratorEndTime = clampTime(this.blockIdToEndTime(endBlockId), this.start, this.end);
+
+        const iterator = this.source.messageIterator({
+          topics: Array.from(topicsToFetch),
+          start: iteratorStartTime,
+          end: iteratorEndTime,
+        });
+
+        let messagesByTopic: Record<string, MessageEvent<unknown>[]> = {};
+        // Set all topic arrays to empty to indicate we've read this topic
+        for (const topic of topicsToFetch) {
+          messagesByTopic[topic] = [];
+        }
+
+        let currentBlockId = fetchBlockId;
+
+        let sizeInBytes = 0;
+        for await (const iterResult of iterator) {
+          if (iterResult.problem) {
+            this.problemManager.addProblem(`connid-${iterResult.connectionId}`, iterResult.problem);
+            continue;
+          }
+
+          const messageBlockId = this.timeToBlockId(iterResult.msgEvent.receiveTime);
+
+          if (messageBlockId < currentBlockId) {
+            log.error("Invariant: received a message for a block in the past");
+            throw new Error("Invariant: received a message for a block in the past");
+          }
+
+          // Message is for a different block.
+          // 1. Close out the current block.
+          // 2. Fill in any block gaps.
+          // 3. start a new block.
+          if (messageBlockId !== currentBlockId) {
+            // Close out the current block with the aggregated messages. Fill any blocks between
+            // current and the new block with empty topic arrays. We can use empty arrays because we
+            // know these blocks have no messages since messages arrive in time order.
+            for (let idx = currentBlockId; idx < messageBlockId; ++idx) {
+              const existingBlock = this.blocks[idx];
+
+              this.blocks[idx] = {
+                messagesByTopic: {
+                  ...existingBlock?.messagesByTopic,
+                  ...messagesByTopic,
+                },
+                sizeInBytes: sizeInBytes + (existingBlock?.sizeInBytes ?? 0),
+              };
+
+              // setup a new block cache for the next block
+              messagesByTopic = {};
+              // Set all topic arrays to empty to indicate we've read this topic
+              for (const topic of topicsToFetch) {
+                messagesByTopic[topic] = [];
+              }
+            }
+
+            progress = this.calculateProgress(topics);
+
+            // Set the new block to the id of our latest message
+            currentBlockId = messageBlockId;
+
+            args.progress(progress);
+          }
+
+          // When the topics change we re bail and will re-load
+          // Since topics changing is in-frequent and usually indicates we need to reload blocks
           if (topics !== this.topics) {
             log.debug("topics changed, aborting load instance");
             return;
           }
 
+          const msgTopic = iterResult.msgEvent.topic;
+          const events = messagesByTopic[msgTopic];
+
+          const problemKey = `unexpected-topic-${msgTopic}`;
+          if (!events) {
+            this.problemManager.addProblem(problemKey, {
+              severity: "error",
+              message: `Received a messaged on an unexpected topic: ${msgTopic}.`,
+            });
+
+            continue;
+          }
+          this.problemManager.removeProblem(problemKey);
+
+          const messageSizeInBytes = iterResult.msgEvent.sizeInBytes;
+          sizeInBytes += messageSizeInBytes;
+
+          while (totalBlockSizeBytes + messageSizeInBytes > this.maxCacheSize) {
+            const evictedSize = this.evictBlock({
+              startId: this.activeBlockId,
+              endId: currentBlockId,
+            });
+            // If we could not evict any blocks to bring our size down, then we stop loading more data
+            if (evictedSize === 0) {
+              return;
+            }
+
+            totalBlockSizeBytes -= evictedSize;
+          }
+
           // When the active block id changes, we need to check whether the active block
           // is loaded through where we are loading (or the end if active block is after currentBlockId)
-
           if (beginBlockId !== this.activeBlockId) {
-            const endId =
-              this.activeBlockId <= currentBlockId ? currentBlockId : this.blocks.length - 1;
+            // minus one because the currentBlockIdx is now the next block we are loading
+            // we don't need to compare to that sine we know it hasn't loaded yet but is about to be
+            let scanToBlockIdx = currentBlockId - 1;
 
-            // The active block is the one we are loading, so we keep going
-            if (this.activeBlockId !== currentBlockId) {
-              for (let idx = this.activeBlockId; idx < endId; ++idx) {
-                const checkBlock = this.blocks[idx];
+            // If the active block id > the block we scan to, then we need to scan to end
+            if (this.activeBlockId > scanToBlockIdx) {
+              scanToBlockIdx = this.blocks.length - 1;
+            }
 
-                const blockTopics = checkBlock ? Object.keys(checkBlock.messagesByTopic) : [];
+            // scan from active to scanToBlockId
+            for (let scanIdx = this.activeBlockId; scanIdx <= scanToBlockIdx; ++scanIdx) {
+              // figure out the needed topics for scanIdx
 
-                const topicsToFetch = new Set(topics);
-                for (const topic of blockTopics) {
-                  topicsToFetch.delete(topic);
-                }
-                if (topicsToFetch.size > 0) {
-                  log.debug("active block changed, aborting load instance");
-                  return;
-                }
+              const scanTopics = new Set(topicsToFetch);
+
+              // if any scanIdx block needs topics, then we need to bail
+              const existingBlock = this.blocks[scanIdx];
+              const blockTopics = existingBlock ? Object.keys(existingBlock.messagesByTopic) : [];
+
+              for (const topic of blockTopics) {
+                scanTopics.delete(topic);
+              }
+
+              // Our active block needs loading, we abort our existing loading loop
+              // and start working on active.
+              if (scanTopics.size > 0) {
+                return;
               }
             }
           }
+
+          totalBlockSizeBytes += messageSizeInBytes;
+          events.push(iterResult.msgEvent);
         }
 
-        const msgTopic = iterResult.msgEvent.topic;
-        const events = messagesByTopic[msgTopic];
+        // Close out the current block with the aggregated messages. Fill any blocks between
+        // current and the new block with empty topic arrays. We can use empty arrays because we
+        // know these blocks have no messages since messages arrive in time order.
+        for (let idx = currentBlockId; idx <= endBlockId; ++idx) {
+          const existingBlock = this.blocks[idx];
 
-        const problemKey = `unexpected-topic-${msgTopic}`;
-        if (!events) {
-          this.problemManager.addProblem(problemKey, {
-            severity: "error",
-            message: `Received a messaged on an unexpected topic: ${msgTopic}.`,
-          });
+          this.blocks[idx] = {
+            messagesByTopic: {
+              ...existingBlock?.messagesByTopic,
+              ...messagesByTopic,
+            },
+            sizeInBytes: sizeInBytes + (existingBlock?.sizeInBytes ?? 0),
+          };
 
-          continue;
-        }
-        this.problemManager.removeProblem(problemKey);
-
-        const messageSizeInBytes = iterResult.msgEvent.sizeInBytes;
-        sizeInBytes += messageSizeInBytes;
-
-        // Adding this message will exceed the cache size
-        // Evict blocks until we have enough size for the message
-        while (
-          evictQueue.length > 0 &&
-          totalBlockSizeBytes + messageSizeInBytes > this.maxCacheSize
-        ) {
-          const evictId = evictQueue.pop();
-          if (evictId != undefined) {
-            const lastBlock = this.blocks[evictId];
-            this.blocks[evictId] = undefined;
-            if (lastBlock) {
-              totalBlockSizeBytes -= lastBlock.sizeInBytes;
-              totalBlockSizeBytes = Math.max(0, totalBlockSizeBytes);
-            }
+          messagesByTopic = {};
+          // Set all topic arrays to empty to indicate we've read this topic
+          for (const topic of topicsToFetch) {
+            messagesByTopic[topic] = [];
           }
         }
 
-        totalBlockSizeBytes += messageSizeInBytes;
-        events.push(iterResult.msgEvent);
-
-        args.progress(progress);
-      }
-
-      // Close out the current block with the aggregated messages. Fill any blocks between
-      // current and the new block with empty topic arrays. We can use empty arrays because we
-      // know these blocks have no messages since messages arrive in time order.
-      for (let i = currentBlockId; i <= span.endId; ++i) {
-        const existingBlock = this.blocks[i];
-
-        this.blocks[i] = {
-          messagesByTopic: {
-            ...existingBlock?.messagesByTopic,
-            ...messagesByTopic,
-          },
-          sizeInBytes: sizeInBytes + (existingBlock?.sizeInBytes ?? 0),
-        };
-
-        messagesByTopic = {};
-        // Set all topic arrays to empty to indicate we've read this topic
-        for (const topic of span.topics) {
-          messagesByTopic[topic] = [];
-        }
+        // We've processed through endBlockId now, next cycle can skip all those blocks
+        i = endBlockId + 1;
       }
 
       progress = this.calculateProgress(topics);
+      args.progress(progress);
     }
-
-    args.progress(progress);
   }
 
   /// ---- private
+
+  // Evict a block while preserving blocks in the block id range (inclusive)
+  private evictBlock(range: { startId: number; endId: number }): number {
+    if (range.endId < range.startId) {
+      for (let i = range.startId - 1; i > range.endId; --i) {
+        const blockToEvict = this.blocks[i];
+        if (!blockToEvict || blockToEvict.sizeInBytes === 0) {
+          continue;
+        }
+
+        this.blocks[i] = undefined;
+        return blockToEvict.sizeInBytes;
+      }
+    }
+
+    if (range.endId > range.startId) {
+      for (let i = range.startId - 1; i > 0; --i) {
+        const blockToEvict = this.blocks[i];
+        if (!blockToEvict || blockToEvict.sizeInBytes === 0) {
+          continue;
+        }
+
+        this.blocks[i] = undefined;
+        return blockToEvict.sizeInBytes;
+      }
+
+      for (let i = range.endId + 1; i < this.blocks.length; ++i) {
+        const blockToEvict = this.blocks[i];
+        if (!blockToEvict || blockToEvict.sizeInBytes === 0) {
+          continue;
+        }
+
+        this.blocks[i] = undefined;
+        return blockToEvict.sizeInBytes;
+      }
+    }
+
+    return 0;
+  }
 
   private calculateProgress(topics: Set<string>): Progress {
     const fullyLoadedFractionRanges = simplify(

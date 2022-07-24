@@ -641,6 +641,7 @@ export class IterablePlayer implements Player {
   }
 
   /** Emit the player state to the registered listener */
+  // fixme - debouncePromise
   private async _emitState() {
     if (!this._listener) {
       return;
@@ -938,6 +939,7 @@ export class IterablePlayer implements Player {
 
     await this._blockLoader?.startLoading({
       progress: async (progress) => {
+        console.log({ progress });
         this._progress = {
           fullyLoadedFractionRanges: this._progress.fullyLoadedFractionRanges,
           messageCache: progress.messageCache,
