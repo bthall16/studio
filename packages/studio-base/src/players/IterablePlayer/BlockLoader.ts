@@ -162,12 +162,15 @@ export class BlockLoader {
     for (const segment of segments) {
       const [beginBlockId, lastBlockId] = segment;
 
+      console.log({ beginBlockId, lastBlockId });
+
       // starting at beginBlockId, identify the first block we need to load
       // this is our start block, from the start block identify to _load to_ block
       // this is our end block
       // load from start block up to end block
       // if end block is at end, go back to 0 and keep going until we reach beginBlockId
       for (let i = beginBlockId; i < lastBlockId; ++i) {
+        // fixme - fetchBlockId can be looked up onces before beginBlockId
         const fetchBlockId = i;
 
         // Topics we will fetch for this range
@@ -193,6 +196,7 @@ export class BlockLoader {
         // we've found a block that needs fetching
         // now build a continuous span of the next blocks
         for (let endIdx = fetchBlockId + 1; endIdx < this.blocks.length; ++endIdx) {
+          console.log({ endIdx });
           const nextBlock = this.blocks[endIdx];
           const nextBlockTopics = nextBlock ? Object.keys(nextBlock.messagesByTopic) : [];
 
@@ -201,11 +205,17 @@ export class BlockLoader {
             nextTopicsToFetch.delete(topic);
           }
 
-          // Our topics are equal to the next block, we can load them as one long range
-          if (isEqual(topicsToFetch, nextTopicsToFetch)) {
-            endBlockId = endIdx;
+          console.log({ topicsToFetch, nextTopicsToFetch });
+
+          // Topics no longer match, either block is loaded or we'll need to load in another pass
+          if (!isEqual(topicsToFetch, nextTopicsToFetch)) {
+            break;
           }
+
+          endBlockId = endIdx;
         }
+
+        console.log({ fetchBlockId, endBlockId });
 
         // we have a fetchBlockId which is the first block to fetch
         // and we have an endBlockId which is the last block to fetch
