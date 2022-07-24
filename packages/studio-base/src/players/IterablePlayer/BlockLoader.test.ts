@@ -267,117 +267,6 @@ describe("BlockLoader", () => {
     const source = new TestSource();
 
     const loader = new BlockLoader({
-      maxBlocks: 5,
-      cacheSizeBytes: 1,
-      minBlockDurationNs: 1,
-      source,
-      start: { sec: 0, nsec: 0 },
-      end: { sec: 9, nsec: 0 },
-      problemManager: new PlayerProblemManager(),
-    });
-
-    const msgEvents: MessageEvent<unknown>[] = [];
-    for (let i = 0; i < 5; ++i) {
-      msgEvents.push({
-        topic: "a",
-        receiveTime: { sec: i, nsec: 0 },
-        message: undefined,
-        sizeInBytes: 0,
-      });
-    }
-
-    source.messageIterator = async function* messageIterator(
-      args: MessageIteratorArgs,
-    ): AsyncIterableIterator<Readonly<IteratorResult>> {
-      for (let i = 0; i < msgEvents.length; ++i) {
-        const msgEvent = msgEvents[i]!;
-        if (args.start && compare(msgEvent.receiveTime, args.start) < 0) {
-          continue;
-        }
-        if (args.end && compare(msgEvent.receiveTime, args.end) > 0) {
-          continue;
-        }
-
-        yield {
-          msgEvent,
-          problem: undefined,
-          connectionId: undefined,
-        };
-      }
-    };
-
-    loader.setTopics(new Set("a"));
-
-    let count = 0;
-    await loader.startLoading({
-      progress: async (progress) => {
-        count += 1;
-        if (count >= 1) {
-          loader.setActiveTime({ sec: 5, nsec: 0 });
-        }
-
-        // when progress matches what we want we've finished loading
-        if (progress.messageCache?.blocks.every((item) => item != undefined) === true) {
-          // eslint-disable-next-line jest/no-conditional-expect
-          expect(progress).toEqual({
-            fullyLoadedFractionRanges: [
-              {
-                start: 0,
-                end: 1,
-              },
-            ],
-            messageCache: {
-              blocks: [
-                {
-                  messagesByTopic: {
-                    a: [msgEvents[0], msgEvents[1]],
-                  },
-                  sizeInBytes: 0,
-                },
-                {
-                  messagesByTopic: {
-                    a: [msgEvents[2], msgEvents[3]],
-                  },
-                  sizeInBytes: 0,
-                },
-                {
-                  messagesByTopic: {
-                    a: [msgEvents[4]],
-                  },
-                  sizeInBytes: 0,
-                },
-                {
-                  messagesByTopic: {
-                    a: [],
-                  },
-                  sizeInBytes: 0,
-                },
-                {
-                  messagesByTopic: {
-                    a: [],
-                  },
-                  sizeInBytes: 0,
-                },
-              ],
-              startTime: { sec: 0, nsec: 0 },
-            },
-          });
-          await loader.stopLoading();
-        }
-      },
-    });
-
-    expect.assertions(1);
-  });
-
-  // fixme - loading not from start, then going back to start and loading seemed to not realize some area had already been loaded...
-  // basically when loading reaches a section that has already loaded, it doesn't seem like it realizes that
-
-  // fixme - better name
-  it.only("should reset loading when active time moves to an unloaded region2", async () => {
-    const source = new TestSource();
-
-    const loader = new BlockLoader({
       maxBlocks: 6,
       cacheSizeBytes: 1,
       minBlockDurationNs: 1,
@@ -397,10 +286,11 @@ describe("BlockLoader", () => {
       });
     }
 
+    const messageIteratorCallArgs: MessageIteratorArgs[] = [];
     source.messageIterator = async function* messageIterator(
       args: MessageIteratorArgs,
     ): AsyncIterableIterator<Readonly<IteratorResult>> {
-      console.log(args);
+      messageIteratorCallArgs.push(args);
       for (let i = 0; i < msgEvents.length; ++i) {
         const msgEvent = msgEvents[i]!;
         if (args.start && compare(msgEvent.receiveTime, args.start) < 0) {
@@ -424,12 +314,122 @@ describe("BlockLoader", () => {
     await loader.startLoading({
       progress: async (progress) => {
         count += 1;
+
         if (count === 1) {
           loader.setActiveTime({ sec: 6, nsec: 0 });
+          // eslint-disable-next-line jest/no-conditional-expect
+          expect(progress).toEqual({
+            fullyLoadedFractionRanges: [
+              {
+                start: 0,
+                end: 0.16666666666666666,
+              },
+            ],
+            messageCache: {
+              blocks: [
+                {
+                  messagesByTopic: {
+                    a: [msgEvents[0], msgEvents[1]],
+                  },
+                  sizeInBytes: 0,
+                },
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+              ],
+              startTime: { sec: 0, nsec: 0 },
+            },
+          });
         } else if (count === 3) {
           loader.setActiveTime({ sec: 1, nsec: 0 });
+
+          // eslint-disable-next-line jest/no-conditional-expect
+          expect(progress).toEqual({
+            fullyLoadedFractionRanges: [
+              {
+                start: 0,
+                end: 0.16666666666666666,
+              },
+              {
+                start: 0.5,
+                end: 0.8333333333333334,
+              },
+            ],
+            messageCache: {
+              blocks: [
+                {
+                  messagesByTopic: {
+                    a: [msgEvents[0], msgEvents[1]],
+                  },
+                  sizeInBytes: 0,
+                },
+                undefined,
+                undefined,
+                {
+                  messagesByTopic: {
+                    a: [msgEvents[5], msgEvents[6]],
+                  },
+                  sizeInBytes: 0,
+                },
+                {
+                  messagesByTopic: {
+                    a: [msgEvents[7]],
+                  },
+                  sizeInBytes: 0,
+                },
+                undefined,
+              ],
+              startTime: { sec: 0, nsec: 0 },
+            },
+          });
+        } else if (count === 4) {
+          // eslint-disable-next-line jest/no-conditional-expect
+          expect(progress).toEqual({
+            fullyLoadedFractionRanges: [
+              {
+                start: 0,
+                end: 0.3333333333333333,
+              },
+              {
+                start: 0.5,
+                end: 0.8333333333333334,
+              },
+            ],
+            messageCache: {
+              blocks: [
+                {
+                  messagesByTopic: {
+                    a: [msgEvents[0], msgEvents[1]],
+                  },
+                  sizeInBytes: 0,
+                },
+                {
+                  messagesByTopic: {
+                    a: [msgEvents[2], msgEvents[3]],
+                  },
+                  sizeInBytes: 0,
+                },
+                undefined,
+                {
+                  messagesByTopic: {
+                    a: [msgEvents[5], msgEvents[6]],
+                  },
+                  sizeInBytes: 0,
+                },
+                {
+                  messagesByTopic: {
+                    a: [msgEvents[7]],
+                  },
+                  sizeInBytes: 0,
+                },
+                undefined,
+              ],
+              startTime: { sec: 0, nsec: 0 },
+            },
+          });
         }
-        console.log(progress);
 
         // when progress matches what we want we've finished loading
         if (progress.messageCache?.blocks.every((item) => item != undefined) === true) {
@@ -463,13 +463,19 @@ describe("BlockLoader", () => {
                 },
                 {
                   messagesByTopic: {
-                    a: [],
+                    a: [msgEvents[5], msgEvents[6]],
                   },
                   sizeInBytes: 0,
                 },
                 {
                   messagesByTopic: {
-                    a: [],
+                    a: [msgEvents[7]],
+                  },
+                  sizeInBytes: 0,
+                },
+                {
+                  messagesByTopic: {
+                    a: [msgEvents[8], msgEvents[9]],
                   },
                   sizeInBytes: 0,
                 },
@@ -482,7 +488,30 @@ describe("BlockLoader", () => {
       },
     });
 
-    expect.assertions(1);
+    expect(messageIteratorCallArgs).toEqual([
+      {
+        topics: ["a"],
+        start: { sec: 0, nsec: 0 },
+        end: { sec: 9, nsec: 0 },
+      },
+      {
+        topics: ["a"],
+        start: { sec: 4, nsec: 500000003 },
+        end: { sec: 9, nsec: 0 },
+      },
+      {
+        topics: ["a"],
+        start: { sec: 1, nsec: 500000001 },
+        end: { sec: 4, nsec: 500000002 },
+      },
+      {
+        topics: ["a"],
+        start: { sec: 7, nsec: 500000005 },
+        end: { sec: 9, nsec: 0 },
+      },
+    ]);
+
+    expect.assertions(6);
   });
 
   // fixme

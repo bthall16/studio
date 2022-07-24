@@ -196,7 +196,6 @@ export class BlockLoader {
         // we've found a block that needs fetching
         // now build a continuous span of the next blocks
         for (let endIdx = fetchBlockId + 1; endIdx < this.blocks.length; ++endIdx) {
-          console.log({ endIdx });
           const nextBlock = this.blocks[endIdx];
           const nextBlockTopics = nextBlock ? Object.keys(nextBlock.messagesByTopic) : [];
 
@@ -204,8 +203,6 @@ export class BlockLoader {
           for (const topic of nextBlockTopics) {
             nextTopicsToFetch.delete(topic);
           }
-
-          console.log({ topicsToFetch, nextTopicsToFetch });
 
           // Topics no longer match, either block is loaded or we'll need to load in another pass
           if (!isEqual(topicsToFetch, nextTopicsToFetch)) {
