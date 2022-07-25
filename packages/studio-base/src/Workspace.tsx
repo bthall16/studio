@@ -221,12 +221,7 @@ export default function Workspace(props: WorkspaceProps): JSX.Element {
   // when the user wants to select a new connection we track whether the sidebar item opened
   const userSelectSidebarItem = useRef(false);
 
-  const lastSelectedSidebarItem = useRef<SidebarItemKey | undefined>(undefined);
-
   const selectSidebarItem = useCallback((item: SidebarItemKey | undefined) => {
-    if (item != undefined) {
-      lastSelectedSidebarItem.current = item;
-    }
     userSelectSidebarItem.current = true;
     setSelectedSidebarItem(item);
   }, []);
