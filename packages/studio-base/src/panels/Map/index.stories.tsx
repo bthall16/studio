@@ -118,7 +118,7 @@ SinglePoint.parameters = {
 };
 
 export const SinglePointWithSettings = (): JSX.Element => {
-  return <MapPanel overrideConfig={{ layer: "custom" }} />;
+  return <MapPanel overrideConfig={{ layer: "custom", topicColors: { "/gps": "pink" } }} />;
 };
 
 SinglePointWithSettings.parameters = {
